@@ -348,20 +348,23 @@ DGMGRL> show configuration;
 1. PRIMARY执行以下命令：
 
 ```sql
--- Mount the database, configure flashback retention, start flashback database and open the database.
+-- Mount the database, configure flashback retention
+-- start flashback database and open the database.
 SQL> SHUTDOWN IMMEDIATE;
 SQL> STARTUP MOUNT;
 SQL> ALTER SYSTEM SET DB_FLASHBACK_RETENTION_TARGET=1440; 
 -- Set up for 24 hour retention 
 SQL> ALTER DATABASE FLASHBACK ON;
+-- 如何此处出现错误，请使用startup restrict命令。
 SQL> ALTER DATABASE OPEN;
 -- 可以使用：select flashback_on from v$database; 查看是否开启flashback.
 ```
 
-2. STANDBY 执行以下命令，*注意先取消redo apply*
+2. STANDBY 执行以下命令，**注意先取消redo apply**
 
 ```sql
--- Stop redo apply, configure flashback retention, start flashback database, open the database and start redo apply (Is active DG).
+-- Stop redo apply, configure flashback retention
+-- start flashback database, open the database and start redo apply (Is active DG).
 SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
 SQL> ALTER SYSTEM SET DB_FLASHBACK_RETENTION_TARGET=1440;
 SQL> ALTER DATABASE FLASHBACK ON;
@@ -383,7 +386,7 @@ DGMGRL> show configuration;
 c:\dgmgrl
 DGMGRL> connect sys/sys@standby;
 DGMGRL> show configuration;
-DGMGRL> failover to 'standby'; -- new machine is standby
+DGMGRL> failover to 'standby'; -- new machine is standby, standby become the primary
 c:\> sqlplus / as sysdba;
 SQL> startup;
 
@@ -396,35 +399,131 @@ SQL> STARTUP MOUNT;
 SQL> ALTER DATABASE CONVERT TO PHYSICAL STANDBY;
 SQL> SELECT DATABASE_ROLE FROM V$DATABASE;
 -- PHYSICAL STANDBY
+
+-- 故障主机进行重启，并进入MOUNT模式
+SQL> SHUTDOWN IMMEDIATE;
+SQL> STARTUP MOUNT;
 -- 新主机执行，最好重新tnsping一下，同时重新连接一下dgmgrl
 C:\> LSNRCTL STOP
 C:\> LSNRCTL START
 -- 主备均执行一次，切记！
 C:\> TNSPING PRIMARY
 C:\> TNSPING STANDBY -- 查看primary和standby是否监听都通畅
--- 故障主机进行重启，并进入MOUNT模式
-SQL> SHUTDOWN IMMEDIATE;
-SQL> STARTUP MOUNT;
 -- 新主机执行
-SQL> SHUTDOWN IMMEDIATE;
-SQL> STARTUP;
-
 c:\dgmgrl
 DGMGRL> connect sys/sys@standby;
 DGMGRL> reinstate database 'primary'; -- 恢复主机database
 
 -- if succeed! then cogratulation!
 -- 重启备机数据库，并使其应用realtime redo apply
--- you succeed! 
--- 备机执行(恢复的故障原主机)
-SQL > ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+-- you succeed! ,此时备库是实时应用。
+-- 备机执行(恢复的故障原主机) [optional]，just to make sure the environment safe。
+SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
 SQL> ALTER DATABASE OPEN;
 SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT;
 ```
 
+### 配置fast-start failover
 
 
 
+```sql
+DGMGRL> connect sys/sys@primary 
 
+DGMGRL> help edit 
 
+Primary:
+DGMGRL> edit database primary set property LogXptMode='SYNC';
+Standby:
+DGMGRL> edit database standby set property LogXptMode='SYNC';
 
+Primary:
+DGMGRL> edit configuration set protection mode as MaxAvailability; 
+Succeeded.
+DGMGRL> show configuration;
+
+SQL> select open_mode,database_role,log_mode,flashback_on from v$database; 
+ 
+OPEN_MODE            DATABASE_ROLE    LOG_MODE     FLASHBACK_ON 
+-------------------- ---------------- ------------ ------------------ 
+READ WRITE           PRIMARY          ARCHIVELOG   YES 
+--flashback的配置目录与大小 
+SQL> show parameter recovery
+
+Standby:
+SQL> select open_mode,database_role,log_mode,flashback_on from v$database; 
+ 
+OPEN_MODE            DATABASE_ROLE    LOG_MODE     FLASHBACK_ON 
+-------------------- ---------------- ------------ ------------------ 
+READ ONLY WITH APPLY PHYSICAL STANDBY ARCHIVELOG   YES 
+
+DGMGRL> edit database primary set property FastStartFailoverTarget=standby; 
+Property "faststartfailovertarget" updated 
+DGMGRL> edit database standby set property  FastStartFailoverTarget=primary; 
+Property "faststartfailovertarget" updated 
+
+--FastStartFailoverPmyShutdown
+
+--FastStartFailoverLagLimit
+
+--FastStartFailoverAutoReinstate
+
+--ObserverConnectIdentifier
+
+DGMGRL> show configuration verbose;
+
+DGMGRL> enable fast_start failover;
+-- 主机如果运行，则当实例断开后，切换备库过程中报出无法启动错误。
+-- 故此命令在备机运行。
+$dgmgrl sys/sys@primary "start observer" -- 断网测试失败，实例无法启动。
+
+$dgmgrl sys/sys@standby "start observer" -- 
+
+```
+
+### 关于主备的一些问题
+
+1. 因为主备机是两个机器，无论把观察者放在哪个机器，都会出现监听断掉无法连接的问题。
+
+2. 对于某些已经测试问题，在此解答：
+
+   * 关于主备机切换的问题。
+     * 如果进行主备切换，需要同时连接主备，主备角色调换，可以采用Broker实现。
+   * 如果出现failover，则备机切换成主机。
+     * 由于主机故障(断网、宕机)，备机可以执行本地命令，切换为主机。SQLPLUS命令或者DGMGRL命令均可以实现。
+   * 如果故障主机恢复，重新构建主备环境，是否必须开启flash back？
+     * 重建主备环境有多种方法，可以重新复制数据文件和控制文件等进行DataGuard环境构建。
+     * 也可以采用RMAN命令进行远程数据文件复制拷贝，重新构建控制文件等。
+     * 如果开启flash back， 则可以进行从节点恢复，而不必拷贝整个数据库，所以建议开启flash back ，缺点是会占用一定的存储空间，大小由设置需求决定。
+   * 如果开启了flash back，则恢复方案有哪些？
+     * 可以采用SQLPLUS执行SQL命令，获取原来备机的SCN号，进行恢复，恢复过程比较复杂同时由于本地机器故障恢复，并不一定可以执行远程命令，来进行DG环境恢复。
+     * 可以构建Broker，当主机恢复后，在主机进行角色切换，转为备机，在备机执行DGMGRL命令，自动进行主机连接和DG环境恢复。
+
+3. 由于测试时间比较短，所以对于某些问题缺乏测试，问题如下：
+
+   * 如果配置
+
+   ​
+
+### 总结
+
+__关于sqlplus远程连接的问题:__
+
+* 如果在**primary**采用如下命令：
+
+   `sqlplus sys/sys  as sysdba@standby `
+
+  则执行的会进入本地SQL交互，不要问为什么，记住，可能是因为**as sysdba **的问题 。
+
+* 远程连接调用sqlplus 命令可以通过以下几种方式进入：
+
+  * `sqlplus sys/sys@[service-name] as sysdba`  
+  * `sqlplus sys/sys@[//][server-name/server-ip]:1521/standby as sysdba`  
+
+* 如果远程的机器的oracle关闭
+
+  * 远程命令`sqlplus sys/sys@[service-name] as sysdba` 无法连接。
+  * 本地执行 `sqlplus / as sysdba` 可以连接。
+  * 本地执行 `sqlplus sys/sys as sysdba` 可以连接。
+
+* 如果想进行远程操作另一台机器的重启，建议在windows下采用PsExec工具，如果是linux，可以使用SSH。因为如果不是系统级的通信连接，则oracle的重启会断开oracle的监听。
